@@ -276,11 +276,6 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
 
 - Swagger 文档：`http://localhost:8001/docs`
 
-### 运行演示脚本
-
-```powershell
-python demo.py
-```
 
 ---
 
@@ -341,9 +336,13 @@ python -m app.worker
 
 ### 1. 正常 success
 
+测试脚本：AIsuccess.ps1
+
 默认使用 `mock` 模式，即可验证 AI 正常输出结构化结果。
 
 ### 2. 低置信度 fallback
+
+测试脚本：lowconf.ps1
 
 提高低置信度阈值，例如：
 
@@ -355,9 +354,13 @@ $env:AIALERT_LLM_LOW_CONFIDENCE="0.95"
 
 ### 3. 异常 fallback
 
+测试脚本：AIabnormal.ps1
+
 切换为 OpenAI 兼容模式，并人为制造 `endpoint` 不可达 / 超时 / 响应异常，验证异常场景下系统是否仍能继续执行兜底流程。
 
 ### 4. AI suppress
+
+测试脚本：AIsuppress.ps1
 
 在 mock 模式下强制模型返回无效告警判断，验证系统是否能产生 AI 抑制结果，并保留对应记录。
 
