@@ -1,0 +1,7 @@
+$env:AIALERT_RUN_WORKER_IN_PROCESS="1"
+$env:AIALERT_BUS="memory"
+$env:AIALERT_LLM_MODE="mock"
+$env:AIALERT_LLM_LOW_CONFIDENCE="0.6"
+$env:AIALERT_LLM_MOCK_FORCE_INVALID="0"
+
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
