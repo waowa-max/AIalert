@@ -149,6 +149,9 @@ class Storage:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_norm_created_at ON normalized_event(created_at)"
         )
+        self._ensure_column(conn, "ticket", "ack_at", "TEXT")
+        self._ensure_column(conn, "ticket", "resolved_at", "TEXT")
+        self._ensure_column(conn, "ticket", "closed_at", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS notify_record (
@@ -202,6 +205,23 @@ class Storage:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_created_at ON ai_analysis_result(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_group ON ai_analysis_result(group_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback_sample (
+              feedback_id TEXT PRIMARY KEY,
+              group_id TEXT NOT NULL,
+              ticket_id TEXT,
+              final_label TEXT NOT NULL,
+              final_severity TEXT,
+              comment TEXT,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_created_at ON feedback_sample(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_group ON feedback_sample(group_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ticket ON feedback_sample(ticket_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_label ON feedback_sample(final_label)")
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -795,7 +815,7 @@ class Storage:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT ticket_id, group_id, priority, status, assignee, created_at, updated_at
+                SELECT ticket_id, group_id, priority, status, assignee, ack_at, resolved_at, closed_at, created_at, updated_at
                 FROM ticket
                 ORDER BY created_at DESC
                 LIMIT ?
@@ -811,8 +831,166 @@ class Storage:
                         "priority": str(r["priority"]),
                         "status": str(r["status"]),
                         "assignee": r["assignee"],
+                        "ack_at": r["ack_at"],
+                        "resolved_at": r["resolved_at"],
+                        "closed_at": r["closed_at"],
                         "created_at": str(r["created_at"]),
                         "updated_at": str(r["updated_at"]),
+                    }
+                )
+            return out
+
+    def get_ticket(self, ticket_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            r = conn.execute(
+                """
+                SELECT ticket_id, group_id, priority, status, assignee, ack_at, resolved_at, closed_at, created_at, updated_at
+                FROM ticket
+                WHERE ticket_id = ?
+                """,
+                (ticket_id,),
+            ).fetchone()
+            if not r:
+                return None
+            return {
+                "ticket_id": str(r["ticket_id"]),
+                "group_id": str(r["group_id"]),
+                "priority": str(r["priority"]),
+                "status": str(r["status"]),
+                "assignee": r["assignee"],
+                "ack_at": r["ack_at"],
+                "resolved_at": r["resolved_at"],
+                "closed_at": r["closed_at"],
+                "created_at": str(r["created_at"]),
+                "updated_at": str(r["updated_at"]),
+            }
+
+    def transition_ticket_status(self, ticket_id: str, new_status: str) -> Dict[str, Any]:
+        allowed = {
+            "NEW": {"ACKED"},
+            "ACKED": {"IN_PROGRESS"},
+            "IN_PROGRESS": {"RESOLVED"},
+            "RESOLVED": {"CLOSED", "REOPENED"},
+            "REOPENED": {"IN_PROGRESS"},
+            "CLOSED": set(),
+        }
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ticket_id, status, ack_at, resolved_at, closed_at
+                FROM ticket
+                WHERE ticket_id = ?
+                """,
+                (ticket_id,),
+            ).fetchone()
+            if not row:
+                raise ValueError("ticket_not_found")
+
+            current = str(row["status"])
+            if current == new_status:
+                raise ValueError("status_no_change")
+            if new_status not in allowed:
+                raise ValueError("status_invalid")
+            if new_status not in allowed.get(current, set()):
+                raise ValueError(f"transition_not_allowed:{current}->{new_status}")
+
+            now = _utc_now()
+            ack_at = row["ack_at"]
+            resolved_at = row["resolved_at"]
+            closed_at = row["closed_at"]
+
+            if current == "NEW" and new_status == "ACKED" and not ack_at:
+                ack_at = now
+            if current == "IN_PROGRESS" and new_status == "RESOLVED" and not resolved_at:
+                resolved_at = now
+            if current == "RESOLVED" and new_status == "CLOSED" and not closed_at:
+                closed_at = now
+            if current == "RESOLVED" and new_status == "REOPENED":
+                closed_at = None
+
+            conn.execute(
+                """
+                UPDATE ticket
+                SET status = ?, ack_at = ?, resolved_at = ?, closed_at = ?, updated_at = ?
+                WHERE ticket_id = ?
+                """,
+                (new_status, ack_at, resolved_at, closed_at, now, ticket_id),
+            )
+        ticket = self.get_ticket(ticket_id)
+        if not ticket:
+            raise ValueError("ticket_not_found")
+        return ticket
+
+    def insert_feedback_sample(
+        self,
+        group_id: str,
+        ticket_id: Optional[str],
+        final_label: str,
+        final_severity: Optional[str],
+        comment: Optional[str],
+    ) -> Dict[str, Any]:
+        feedback_id = f"FB-{uuid.uuid4().hex}"
+        now = _utc_now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO feedback_sample(
+                  feedback_id, group_id, ticket_id, final_label, final_severity, comment, created_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?)
+                """,
+                (feedback_id, group_id, ticket_id, final_label, final_severity, comment, now),
+            )
+        return {
+            "feedback_id": feedback_id,
+            "group_id": group_id,
+            "ticket_id": ticket_id,
+            "final_label": final_label,
+            "final_severity": final_severity,
+            "comment": comment,
+            "created_at": now,
+        }
+
+    def list_feedback_samples(
+        self,
+        limit: int = 50,
+        group_id: Optional[str] = None,
+        ticket_id: Optional[str] = None,
+        final_label: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        where = []
+        params: List[Any] = []
+        if group_id:
+            where.append("group_id = ?")
+            params.append(group_id)
+        if ticket_id:
+            where.append("ticket_id = ?")
+            params.append(ticket_id)
+        if final_label:
+            where.append("final_label = ?")
+            params.append(final_label)
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        sql = (
+            "SELECT feedback_id, group_id, ticket_id, final_label, final_severity, comment, created_at "
+            "FROM feedback_sample"
+            f"{where_sql} "
+            "ORDER BY created_at DESC "
+            "LIMIT ?"
+        )
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                out.append(
+                    {
+                        "feedback_id": str(r["feedback_id"]),
+                        "group_id": str(r["group_id"]),
+                        "ticket_id": r["ticket_id"],
+                        "final_label": str(r["final_label"]),
+                        "final_severity": r["final_severity"],
+                        "comment": r["comment"],
+                        "created_at": str(r["created_at"]),
                     }
                 )
             return out

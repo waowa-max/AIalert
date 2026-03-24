@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from enum import Enum
 from fastapi import Body, FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
@@ -127,12 +128,56 @@ class TicketItem(BaseModel):
     priority: str
     status: str
     assignee: Optional[str] = None
+    ack_at: Optional[str] = None
+    resolved_at: Optional[str] = None
+    closed_at: Optional[str] = None
     created_at: str
     updated_at: str
 
 
 class TicketsResponse(BaseModel):
     items: List[TicketItem]
+
+
+class TicketStatus(str, Enum):
+    NEW = "NEW"
+    ACKED = "ACKED"
+    IN_PROGRESS = "IN_PROGRESS"
+    RESOLVED = "RESOLVED"
+    CLOSED = "CLOSED"
+    REOPENED = "REOPENED"
+
+
+class TicketStatusUpdateRequest(BaseModel):
+    status: TicketStatus = Field(description="目标状态。")
+
+
+class FeedbackLabel(str, Enum):
+    valid = "valid"
+    false_positive = "false_positive"
+    duplicate = "duplicate"
+
+
+class FeedbackCreateRequest(BaseModel):
+    group_id: str = Field(description="聚合实例 ID（INC-xxx）。")
+    ticket_id: Optional[str] = Field(default=None, description="工单 ID（TKT-xxx），可为空。")
+    final_label: FeedbackLabel = Field(description="最终人工标签。")
+    final_severity: Optional[str] = Field(default=None, description="最终严重度（P0~P3），可为空。")
+    comment: Optional[str] = Field(default=None, description="人工说明，可为空。")
+
+
+class FeedbackItem(BaseModel):
+    feedback_id: str
+    group_id: str
+    ticket_id: Optional[str] = None
+    final_label: str
+    final_severity: Optional[str] = None
+    comment: Optional[str] = None
+    created_at: str
+
+
+class FeedbackListResponse(BaseModel):
+    items: List[FeedbackItem]
 
 
 class NotifyRecordItem(BaseModel):
@@ -723,6 +768,149 @@ async def list_groups(limit: int = Query(50, ge=1, le=500)):
 )
 async def list_tickets(limit: int = Query(50, ge=1, le=500)):
     items = storage.list_tickets(limit=limit)
+    return {"items": items}
+
+
+@app.patch(
+    "/tickets/{ticket_id}/status",
+    tags=["Tickets"],
+    summary="更新工单状态（最小状态机）",
+    description=(
+        "用于演示与验收工单最小生命周期管理。接口会对状态流转做基本校验，并在每次状态变化时写入审计流水。\n\n"
+        "状态：NEW -> ACKED -> IN_PROGRESS -> RESOLVED -> CLOSED\n"
+        "可选：RESOLVED -> REOPENED -> IN_PROGRESS\n\n"
+        "建议关注字段：status / ack_at / resolved_at / closed_at / updated_at。\n"
+        "审计留痕：GET /operation_logs 过滤 entity_type=ticket。\n"
+    ),
+    response_model=TicketItem,
+)
+async def patch_ticket_status(
+    ticket_id: str,
+    body: TicketStatusUpdateRequest = Body(
+        ...,
+        openapi_examples={
+            "认领（NEW->ACKED）": {"summary": "认领工单", "value": {"status": "ACKED"}},
+            "开始处理（ACKED->IN_PROGRESS）": {"summary": "开始处理", "value": {"status": "IN_PROGRESS"}},
+            "处理完成（IN_PROGRESS->RESOLVED）": {"summary": "标记已恢复", "value": {"status": "RESOLVED"}},
+            "关闭（RESOLVED->CLOSED）": {"summary": "关闭工单", "value": {"status": "CLOSED"}},
+            "重开（RESOLVED->REOPENED）": {"summary": "重开工单", "value": {"status": "REOPENED"}},
+        },
+    ),
+):
+    before = storage.get_ticket(ticket_id)
+    if not before:
+        raise HTTPException(status_code=404, detail="ticket_not_found")
+    try:
+        after = storage.transition_ticket_status(ticket_id=ticket_id, new_status=body.status.value)
+    except ValueError as e:
+        msg = str(e)
+        if msg == "ticket_not_found":
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
+
+    storage.insert_operation_log(
+        entity_type="ticket",
+        entity_id=ticket_id,
+        action="status_change",
+        actor_type="user",
+        actor_id=None,
+        detail={
+            "before": {"status": before.get("status"), "ack_at": before.get("ack_at"), "resolved_at": before.get("resolved_at"), "closed_at": before.get("closed_at")},
+            "after": {"status": after.get("status"), "ack_at": after.get("ack_at"), "resolved_at": after.get("resolved_at"), "closed_at": after.get("closed_at")},
+        },
+    )
+    return after
+
+
+@app.post(
+    "/feedback",
+    tags=["Rules"],
+    summary="提交人工反馈（最小反馈闭环）",
+    description=(
+        "用于对某个聚合事件（group）或工单（ticket）提交最终人工结论，作为后续规则优化与 AI 样本沉淀基础。\n\n"
+        "final_label 最小枚举：valid / false_positive / duplicate。\n"
+        "建议关注字段：feedback_id / final_label / final_severity / created_at。\n"
+        "审计留痕：GET /operation_logs 过滤 entity_type=feedback_sample。\n"
+    ),
+    response_model=FeedbackItem,
+)
+async def submit_feedback(
+    body: FeedbackCreateRequest = Body(
+        ...,
+        openapi_examples={
+            "有效告警（valid）": {
+                "summary": "确认该聚合事件为真实告警",
+                "value": {
+                    "group_id": "INC-xxx",
+                    "ticket_id": None,
+                    "final_label": "valid",
+                    "final_severity": "P1",
+                    "comment": "确认对业务有影响，已处理恢复。",
+                },
+            },
+            "误报（false_positive）": {
+                "summary": "确认该聚合事件为误报",
+                "value": {
+                    "group_id": "INC-xxx",
+                    "ticket_id": "TKT-xxx",
+                    "final_label": "false_positive",
+                    "final_severity": None,
+                    "comment": "维护窗口内变更导致的预期波动，标记误报。",
+                },
+            },
+            "重复（duplicate）": {
+                "summary": "确认该事件与已有工单重复",
+                "value": {
+                    "group_id": "INC-xxx",
+                    "ticket_id": "TKT-xxx",
+                    "final_label": "duplicate",
+                    "final_severity": None,
+                    "comment": "与工单 TKT-123 重复，仅保留主工单。",
+                },
+            },
+        },
+    )
+):
+    item = storage.insert_feedback_sample(
+        group_id=body.group_id,
+        ticket_id=body.ticket_id,
+        final_label=body.final_label.value,
+        final_severity=body.final_severity,
+        comment=body.comment,
+    )
+    storage.insert_operation_log(
+        entity_type="feedback_sample",
+        entity_id=item["feedback_id"],
+        action="feedback_submit",
+        actor_type="user",
+        actor_id=None,
+        detail=item,
+    )
+    return item
+
+
+@app.get(
+    "/feedback",
+    tags=["Rules"],
+    summary="查询人工反馈样本",
+    description=(
+        "用于查询已提交的人工反馈（最小闭环数据）。可按 group_id / ticket_id / final_label 过滤。\n\n"
+        "建议关注字段：final_label / final_severity / comment / created_at。"
+    ),
+    response_model=FeedbackListResponse,
+)
+async def list_feedback(
+    limit: int = Query(50, ge=1, le=500),
+    group_id: Optional[str] = None,
+    ticket_id: Optional[str] = None,
+    final_label: Optional[FeedbackLabel] = None,
+):
+    items = storage.list_feedback_samples(
+        limit=limit,
+        group_id=group_id,
+        ticket_id=ticket_id,
+        final_label=None if final_label is None else final_label.value,
+    )
     return {"items": items}
 
 
