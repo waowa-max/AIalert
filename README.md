@@ -373,7 +373,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
 启动后访问：
 
 - Swagger 文档：`http://localhost:8001/docs`
-
+![Swagger 演示](docs/images/swagger-demo.png)
 
 ---
 
