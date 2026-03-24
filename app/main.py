@@ -1,10 +1,11 @@
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
 from enum import Enum
-from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Path, Query
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from app.core.storage import Storage
@@ -12,10 +13,14 @@ from app.core.normalization import NormalizationManager
 from app.core.aggregation import FingerprintGenerator
 from app.core.rules import prescreen_drop_reason, silence_candidate
 from app.core.ai import build_incident_request, analyze_incident
+from app.core.models import NormalizedAlert
+from app.adapters import registry as adapter_registry
 from app.core.message_bus import MessageBus
 from app.infra.inmemory_bus import InMemoryBus
 from app.infra.redis_stream_bus import RedisStreamBus
 import uvicorn
+
+logger = logging.getLogger(__name__)
 
 openapi_tags = [
     {"name": "Health", "description": "平台自检与联通性验证。"},
@@ -261,6 +266,19 @@ def _stable_payload_hash(payload: Dict[str, Any]) -> str:
 
 
 def _extract_source_event_id(source: str, payload: Dict[str, Any]) -> str:
+    # 优先尝试通过适配层提取统一 source_event_id，失败时回退到历史逻辑
+    try:
+        events = adapter_registry.parse_events(source, payload)
+        if len(events) == 1 and events[0].source_event_id:
+            return str(events[0].source_event_id)
+        if len(events) > 1:
+            event_ids = [str(ev.source_event_id or "").strip() for ev in events]
+            valid_ids = sorted([eid for eid in event_ids if eid])
+            if valid_ids:
+                return f"batch-{hashlib.sha256('|'.join(valid_ids).encode('utf-8')).hexdigest()[:16]}"
+    except Exception:
+        pass
+
     # 不同告警源的“原始事件 ID”字段不一致，需要按 source 做映射
     if source == "SLS":
         return str(payload.get("alert_id") or "")
@@ -325,63 +343,134 @@ def _worker_loop(stop_event: threading.Event) -> None:
                 progressed += 1
                 continue
             try:
-                # 2.1 标准化：把不同来源 payload 统一为 NormalizedAlert
-                alert = normalizer.normalize(raw.source_system, raw.payload)
-                alert.event_id = raw.id
-                fp = FingerprintGenerator.generate(alert)
-                alert.fingerprint = fp
-
-                service = alert.resource.get("service") or alert.resource.get("app") or "unknown_service"
-                now_iso = _utc_now_iso()
-                severity_val = getattr(alert.severity, "value", str(alert.severity))
-                status_val = getattr(alert.status, "value", str(alert.status))
-
-                # 2.2 规则预筛：用于快速过滤明显噪音（示例：非 prod）
-                drop_reason = prescreen_drop_reason(alert)
-                silenced = False
-                silence_rule_id = None
-                if not drop_reason:
-                    # 2.3 静默：命中静默规则时不触发开单/通知（但仍记录标准化结果）
-                    silence_rule_id = storage.match_silence_rule(silence_candidate(alert))
-                    silenced = silence_rule_id is not None
-
-                # 2.4 标准化事件落库（raw_alert_id UNIQUE，保证同 raw 不会重复处理）
-                inserted = storage.insert_normalized_event(
-                    event_id=alert.event_id,
-                    raw_alert_id=raw.id,
-                    occurred_at=alert.occurred_at.isoformat(),
-                    service=service,
-                    metric_name=alert.metric_name,
-                    severity=severity_val,
-                    status=status_val,
-                    fingerprint=fp,
-                    labels=alert.labels or {},
-                    resource=alert.resource or {},
-                    dropped=bool(drop_reason),
-                    drop_reason=drop_reason,
-                    silenced=silenced,
-                    silence_rule_id=silence_rule_id,
-                )
-
-                if inserted and not drop_reason:
-                    # 2.5 聚合：按 fingerprint 在时间窗口内合并为 incident_group
-                    incident, is_new = storage.upsert_incident(
-                        fingerprint=fp,
-                        title=_incident_title(severity_val, service, alert.metric_name),
-                        severity=severity_val,
-                        now_iso=now_iso,
-                        window_seconds=AGG_WINDOW_SECONDS,
-                    )
-                    # 2.6 产出 incident 事件：通知后续“开单/通知”消费者
-                    bus.publish(
-                        INCIDENT_STREAM,
+                try:
+                    events = adapter_registry.parse_events(raw.source_system, raw.payload)
+                except ValueError:
+                    legacy = normalizer.normalize(raw.source_system, raw.payload)
+                    legacy_service = legacy.resource.get("service") or legacy.resource.get("app") or "unknown_service"
+                    legacy_instance = legacy.resource.get("instance") or legacy.resource.get("pod") or legacy.resource.get("host") or "unknown_instance"
+                    events = [
                         {
-                            "group_id": incident.group_id,
-                            "severity": severity_val,
-                            "is_new": "1" if is_new else "0",
-                            "silenced": "1" if silenced else "0",
-                        },
-                    )
+                            "source": legacy.source_system,
+                            "source_event_id": legacy.source_event_id,
+                            "title": f"{legacy_service} - {legacy.metric_name}",
+                            "service": legacy_service,
+                            "metric_name": legacy.metric_name,
+                            "severity": legacy.severity,
+                            "status": legacy.status,
+                            "instance": legacy_instance,
+                            "labels": legacy.labels or {},
+                            "annotations": {},
+                            "starts_at": legacy.occurred_at,
+                            "ends_at": None,
+                        }
+                    ]
+
+                now_iso = _utc_now_iso()
+                for idx, ev in enumerate(events):
+                    try:
+                        evd = (
+                            {
+                                "source": ev.source,
+                                "source_event_id": ev.source_event_id,
+                                "title": ev.title,
+                                "service": ev.service,
+                                "metric_name": ev.metric_name,
+                                "severity": ev.severity,
+                                "status": ev.status,
+                                "instance": ev.instance,
+                                "labels": ev.labels,
+                                "annotations": ev.annotations,
+                                "starts_at": ev.starts_at,
+                                "ends_at": ev.ends_at,
+                            }
+                            if hasattr(ev, "source")
+                            else ev
+                        )
+                        alert = NormalizedAlert(
+                            event_id=f"{raw.id}:{idx}",
+                            source_system=str(evd["source"]),
+                            source_event_id=str(evd["source_event_id"]),
+                            occurred_at=evd["starts_at"],
+                            resource={"service": evd["service"], "instance": evd["instance"]},
+                            metric_name=str(evd["metric_name"]),
+                            severity=evd["severity"],
+                            status=evd["status"],
+                            labels=evd.get("labels") or {},
+                            raw_payload=raw.payload,
+                        )
+                        fp = FingerprintGenerator.generate(alert)
+                        alert.fingerprint = fp
+
+                        service = str(evd["service"] or "unknown_service")
+                        severity_val = getattr(alert.severity, "value", str(alert.severity))
+                        status_val = getattr(alert.status, "value", str(alert.status))
+
+                        drop_reason = prescreen_drop_reason(alert)
+                        silenced = False
+                        silence_rule_id = None
+                        if not drop_reason:
+                            silence_rule_id = storage.match_silence_rule(silence_candidate(alert))
+                            silenced = silence_rule_id is not None
+
+                        inserted = storage.insert_normalized_event(
+                            event_id=alert.event_id,
+                            raw_alert_id=raw.id,
+                            occurred_at=alert.occurred_at.isoformat(),
+                            starts_at=evd["starts_at"].isoformat() if evd.get("starts_at") else None,
+                            ends_at=evd["ends_at"].isoformat() if evd.get("ends_at") else None,
+                            service=service,
+                            metric_name=str(evd["metric_name"]),
+                            title=str(evd.get("title") or None),
+                            instance=str(evd.get("instance") or None),
+                            severity=severity_val,
+                            status=status_val,
+                            fingerprint=fp,
+                            labels=evd.get("labels") or {},
+                            annotations=evd.get("annotations") or {},
+                            resource={"service": service, "instance": evd.get("instance")},
+                            dropped=bool(drop_reason),
+                            drop_reason=drop_reason,
+                            silenced=silenced,
+                            silence_rule_id=silence_rule_id,
+                        )
+
+                        if inserted and not drop_reason:
+                            incident, is_new = storage.upsert_incident(
+                                fingerprint=fp,
+                                title=_incident_title(severity_val, service, str(evd["metric_name"])),
+                                severity=severity_val,
+                                now_iso=now_iso,
+                                window_seconds=AGG_WINDOW_SECONDS,
+                            )
+                            bus.publish(
+                                INCIDENT_STREAM,
+                                {
+                                    "group_id": incident.group_id,
+                                    "severity": severity_val,
+                                    "is_new": "1" if is_new else "0",
+                                    "silenced": "1" if silenced else "0",
+                                },
+                            )
+                    except Exception as e:
+                        storage.insert_operation_log(
+                            entity_type="raw_alert",
+                            entity_id=raw.id,
+                            action="parse_failed",
+                            actor_type="system",
+                            actor_id=None,
+                            detail={"source": raw.source_system, "error": str(e)},
+                        )
+            except Exception as e:
+                storage.insert_operation_log(
+                    entity_type="raw_alert",
+                    entity_id=raw.id,
+                    action="parse_failed",
+                    actor_type="system",
+                    actor_id=None,
+                    detail={"source": raw.source_system, "error": str(e)},
+                )
+                logger.exception("raw alert parse failed: id=%s source=%s", raw.id, raw.source_system)
             finally:
                 # 对于 Redis Stream：ack 表示该消息已处理完成
                 bus.ack(RAW_STREAM, RAW_GROUP, msg_id)
@@ -571,21 +660,28 @@ async def _shutdown():
 @app.post(
     "/ingest/{source}",
     tags=["Ingest"],
-    summary="接入告警（仅接收与落库，不代表已处置）",
+    summary="接入多源告警（仅接收与落库，不代表已处置）",
     description=(
         "用于接入不同来源的告警 Webhook。该接口**仅保证**接收成功并将原始告警写入存储（接入不丢）。\n\n"
+        "当前已内置基础适配：SLS、Prometheus Alertmanager、Grafana Alerting。\n\n"
+        "请将 source 参数与 request body 示例保持一致，例如 source=prometheus 时请选择 Prometheus 示例。\n\n"
         "注意：返回 accepted 并不代表已完成标准化/规则预筛/聚合/AI 分析/开单/通知，这些都是异步处理。\n\n"
         "建议关注字段：raw_alert_id / idempotency_key / duplicated。"
     ),
     response_model=IngestAcceptedResponse,
 )
 async def ingest_alert(
-    source: str,
+    source: str = Path(
+        ...,
+        description="告警来源。建议从枚举中选择并与 request body 示例保持一致。",
+        json_schema_extra={"enum": ["SLS", "prometheus", "grafana"]},
+    ),
     raw_payload: Dict[str, Any] = Body(
         ...,
         openapi_examples={
-            "主链路测试样例（SLS）": {
-                "summary": "用于验证接入、落库、聚合、开单通知主链路",
+            "SLS 示例": {
+                "summary": "SLS Webhook 示例",
+                "description": "来源：阿里云日志服务告警（SLS）。",
                 "value": {
                     "alert_id": "sls-main-001",
                     "alert_name": "CPU_USAGE_HIGH",
@@ -599,34 +695,52 @@ async def ingest_alert(
                     "labels": {"env": "prod"},
                 },
             },
-            "聚合测试样例（SLS，同服务同规则不同实例）": {
-                "summary": "多次发送该样例（仅 alert_id/pod 不同）应聚合到同一 group",
+            "Prometheus 示例": {
+                "summary": "标准 alerts 数组；每个 alert 会拆成一条标准事件",
+                "description": "来源：Prometheus Alertmanager Webhook。",
                 "value": {
-                    "alert_id": "sls-agg-001",
-                    "alert_name": "CPU_USAGE_HIGH",
-                    "service": "order-service",
-                    "pod": "pod-2",
-                    "cluster": "prod-sh-1",
-                    "severity": "high",
-                    "value": 97.1,
-                    "timestamp": 1760000001,
+                    "receiver": "web.hook",
                     "status": "firing",
-                    "labels": {"env": "prod"},
+                    "groupLabels": {"alertname": "HighCPUUsage"},
+                    "commonLabels": {"service": "order-service"},
+                    "alerts": [
+                        {
+                            "status": "firing",
+                            "labels": {
+                                "alertname": "HighCPUUsage",
+                                "severity": "critical",
+                                "instance": "10.0.0.12:9100",
+                                "job": "node-exporter",
+                                "service": "order-service"
+                            },
+                            "annotations": {
+                                "summary": "CPU usage is too high",
+                                "description": "CPU usage over 90% for 5m"
+                            },
+                            "startsAt": "2026-03-24T10:00:00Z",
+                            "endsAt": "2026-03-24T10:05:00Z",
+                            "fingerprint": "am-001"
+                        }
+                    ]
                 },
             },
-            "AI 抑制测试样例（SLS）": {
-                "summary": "配合 AIALERT_LLM_MOCK_FORCE_INVALID=1 触发 ai_suppressed",
+            "Grafana 示例": {
+                "summary": "Grafana 常见 webhook 格式",
+                "description": "来源：Grafana Alerting Webhook。",
                 "value": {
-                    "alert_id": "sls-ai-suppress-001",
-                    "alert_name": "CPU_USAGE_HIGH",
-                    "service": "order-service",
-                    "pod": "pod-3",
-                    "cluster": "prod-sh-1",
-                    "severity": "high",
-                    "value": 99.0,
-                    "timestamp": 1760000002,
-                    "status": "firing",
-                    "labels": {"env": "prod"},
+                    "title": "[FIRING:1] High error rate",
+                    "state": "alerting",
+                    "ruleName": "HTTP 5xx Rate High",
+                    "message": "Error rate exceeded threshold",
+                    "tags": {
+                        "service": "payment-service",
+                        "instance": "pod-a1",
+                        "severity": "high"
+                    },
+                    "evalMatches": [
+                        {"value": 8.2, "metric": "http_5xx_rate", "tags": {"pod": "pod-a1"}}
+                    ],
+                    "startsAt": "2026-03-24T10:10:00Z"
                 },
             },
         },
@@ -662,7 +776,7 @@ async def ingest_alert(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        print(f"Error processing alert: {e}")
+        logger.exception("ingest failed: source=%s", source)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get(

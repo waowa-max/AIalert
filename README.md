@@ -121,6 +121,57 @@ flowchart LR
 
 不同来源的告警通过同一个入口进入系统，系统内部再进行标准化处理。这样可以把“外部接入差异”与“内部处理链路”分离，降低扩展新的告警源时的改动范围。
 
+当前内置基础适配来源：
+
+- `SLS`（阿里云日志服务告警）
+- `Prometheus` / `Alertmanager`
+- `Grafana` / `Grafana Alerting`
+
+### 1.1 多源适配器机制
+
+当前版本在接入层新增了可扩展适配器机制，核心目录：
+
+- `app/adapters/base.py`
+- `app/adapters/sls.py`
+- `app/adapters/prometheus.py`
+- `app/adapters/grafana.py`
+- `app/adapters/__init__.py`
+
+适配层约定统一接口：
+
+- `resolve_adapter(source, payload)`：根据 `source` 或 payload 特征选择适配器
+- `parse_events(source, payload)`：将不同来源 payload 转为统一事件列表
+
+设计目标：
+
+- 新增告警源时，只需新增 adapter 并注册
+- 主链路 `raw_alert -> normalized_event -> group -> AI -> ticket -> notify -> operation_log -> feedback_sample` 无需重构
+- Prometheus `alerts[]` 支持拆分为多条标准事件，单条解析失败不影响其他可解析项
+
+### 1.2 统一字段归一化
+
+不同来源最终会归一化为统一内部字段，至少包括：
+
+- `source`
+- `source_event_id`
+- `title`
+- `service`
+- `metric_name`
+- `severity`
+- `status`
+- `instance`
+- `labels`
+- `annotations`
+- `starts_at`
+- `ends_at`
+- `raw_payload`
+
+其中：
+
+- `severity` 统一映射到项目内部等级 `P0~P3`
+- 字段缺失时使用合理 fallback，避免单字段缺失导致整条事件丢弃
+- `raw_payload` 保留完整原始请求体，用于审计与回放
+
 ### 2. 原始告警不丢失
 
 所有接入的原始告警优先落库到 `raw_alert`。即使后续被判定为 `dropped / silenced`，也保留基础记录与处理结果，避免“入口即丢弃”导致后续无法审计或复盘。
@@ -531,6 +582,7 @@ $env:AIALERT_LLM_MOCK_FORCE_INVALID="1"
 
 - 按业务流程分组展示接口
 - 为关键写接口提供示例请求体
+- `POST /ingest/{source}` 已提供 `SLS / Prometheus / Grafana` 示例 payload
 - 为查询接口补充建议关注字段与过滤参数
 - 便于按照“接入 → 聚合 → AI → 工单 → 通知 → 审计”的顺序演示
 

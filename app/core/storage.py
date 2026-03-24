@@ -144,11 +144,7 @@ class Storage:
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         # 轻量迁移：用于本地/试运行阶段快速演进字段
-        self._ensure_column(conn, "normalized_event", "silenced", "INTEGER NOT NULL DEFAULT 0")
-        self._ensure_column(conn, "normalized_event", "silence_rule_id", "TEXT")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_norm_created_at ON normalized_event(created_at)"
-        )
+        self._ensure_normalized_event_schema(conn)
         self._ensure_column(conn, "ticket", "ack_at", "TEXT")
         self._ensure_column(conn, "ticket", "resolved_at", "TEXT")
         self._ensure_column(conn, "ticket", "closed_at", "TEXT")
@@ -223,6 +219,123 @@ class Storage:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_ticket ON feedback_sample(ticket_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_feedback_label ON feedback_sample(final_label)")
 
+    def _ensure_normalized_event_schema(self, conn: sqlite3.Connection) -> None:
+        # normalized_event 需要支持：
+        # - 多事件：Prometheus Alertmanager 一个 payload 可能包含 alerts 数组
+        # - 扩展字段：title/instance/annotations/starts_at/ends_at/silenced 等
+        target_columns = [
+            ("silenced", "INTEGER NOT NULL DEFAULT 0", "0"),
+            ("silence_rule_id", "TEXT", "NULL"),
+            ("title", "TEXT", "NULL"),
+            ("instance", "TEXT", "NULL"),
+            ("annotations_json", "TEXT", "NULL"),
+            ("starts_at", "TEXT", "NULL"),
+            ("ends_at", "TEXT", "NULL"),
+        ]
+
+        old_cols = {str(c["name"]) for c in conn.execute("PRAGMA table_info(normalized_event)").fetchall()}
+        needs_rebuild = self._normalized_event_raw_alert_unique(conn)
+
+        if needs_rebuild:
+            old_cols_list = list(old_cols)
+            conn.execute("ALTER TABLE normalized_event RENAME TO normalized_event_old")
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS normalized_event (
+                  event_id TEXT PRIMARY KEY,
+                  raw_alert_id TEXT NOT NULL,
+                  occurred_at TEXT NOT NULL,
+                  starts_at TEXT,
+                  ends_at TEXT,
+                  service TEXT NOT NULL,
+                  metric_name TEXT NOT NULL,
+                  title TEXT,
+                  instance TEXT,
+                  severity TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  fingerprint TEXT,
+                  labels_json TEXT NOT NULL,
+                  annotations_json TEXT,
+                  resource_json TEXT NOT NULL,
+                  dropped INTEGER NOT NULL DEFAULT 0,
+                  drop_reason TEXT,
+                  silenced INTEGER NOT NULL DEFAULT 0,
+                  silence_rule_id TEXT,
+                  created_at TEXT NOT NULL,
+                  FOREIGN KEY(raw_alert_id) REFERENCES raw_alert(id)
+                )
+                """
+            )
+
+            select_exprs = []
+            insert_cols = [
+                "event_id",
+                "raw_alert_id",
+                "occurred_at",
+                "starts_at",
+                "ends_at",
+                "service",
+                "metric_name",
+                "title",
+                "instance",
+                "severity",
+                "status",
+                "fingerprint",
+                "labels_json",
+                "annotations_json",
+                "resource_json",
+                "dropped",
+                "drop_reason",
+                "silenced",
+                "silence_rule_id",
+                "created_at",
+            ]
+            defaults = {
+                "starts_at": "NULL",
+                "ends_at": "NULL",
+                "title": "NULL",
+                "instance": "NULL",
+                "annotations_json": "NULL",
+                "silenced": "0",
+                "silence_rule_id": "NULL",
+            }
+
+            for col in insert_cols:
+                if col in old_cols:
+                    select_exprs.append(col)
+                else:
+                    select_exprs.append(defaults.get(col, "NULL"))
+
+            conn.execute(
+                f"""
+                INSERT INTO normalized_event({",".join(insert_cols)})
+                SELECT {",".join(select_exprs)}
+                FROM normalized_event_old
+                """
+            )
+            conn.execute("DROP TABLE normalized_event_old")
+        else:
+            for name, ddl, _default_expr in target_columns:
+                if name not in old_cols:
+                    self._ensure_column(conn, "normalized_event", name, ddl)
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_norm_created_at ON normalized_event(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_norm_raw_alert ON normalized_event(raw_alert_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_norm_fp ON normalized_event(fingerprint)")
+
+    def _normalized_event_raw_alert_unique(self, conn: sqlite3.Connection) -> bool:
+        # 判断 normalized_event 是否对 raw_alert_id 有 UNIQUE 约束（旧版本为 raw_alert_id UNIQUE）
+        indexes = conn.execute("PRAGMA index_list(normalized_event)").fetchall()
+        for idx in indexes:
+            if not idx["unique"]:
+                continue
+            idx_name = str(idx["name"])
+            cols = conn.execute(f"PRAGMA index_info({idx_name})").fetchall()
+            col_names = [str(c["name"]) for c in cols]
+            if col_names == ["raw_alert_id"] or "raw_alert_id" in col_names:
+                return True
+        return False
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         cols = conn.execute(f"PRAGMA table_info({table})").fetchall()
         for c in cols:
@@ -321,12 +434,17 @@ class Storage:
         event_id: str,
         raw_alert_id: str,
         occurred_at: str,
+        starts_at: Optional[str],
+        ends_at: Optional[str],
         service: str,
         metric_name: str,
+        title: Optional[str],
+        instance: Optional[str],
         severity: str,
         status: str,
         fingerprint: Optional[str],
         labels: Dict[str, Any],
+        annotations: Dict[str, Any],
         resource: Dict[str, Any],
         dropped: bool,
         drop_reason: Optional[str],
@@ -341,9 +459,10 @@ class Storage:
                     """
                     INSERT INTO normalized_event(
                       event_id, raw_alert_id, occurred_at, service, metric_name, severity, status, fingerprint,
-                      labels_json, resource_json, dropped, drop_reason, silenced, silence_rule_id, created_at
+                      starts_at, ends_at, title, instance, labels_json, annotations_json, resource_json,
+                      dropped, drop_reason, silenced, silence_rule_id, created_at
                     )
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event_id,
@@ -354,7 +473,12 @@ class Storage:
                         severity,
                         status,
                         fingerprint,
+                        starts_at,
+                        ends_at,
+                        title,
+                        instance,
                         _json_dumps(labels),
+                        _json_dumps(annotations),
                         _json_dumps(resource),
                         1 if dropped else 0,
                         drop_reason,
@@ -383,8 +507,8 @@ class Storage:
             params.append(1 if dropped else 0)
         where_sql = (" WHERE " + " AND ".join(where)) if where else ""
         sql = (
-            "SELECT event_id, raw_alert_id, occurred_at, service, metric_name, severity, status, fingerprint, "
-            "dropped, drop_reason, silenced, silence_rule_id, created_at "
+            "SELECT event_id, raw_alert_id, occurred_at, starts_at, ends_at, service, metric_name, title, instance, "
+            "severity, status, fingerprint, dropped, drop_reason, silenced, silence_rule_id, created_at "
             "FROM normalized_event"
             f"{where_sql} "
             "ORDER BY created_at DESC "
@@ -400,8 +524,12 @@ class Storage:
                         "event_id": str(r["event_id"]),
                         "raw_alert_id": str(r["raw_alert_id"]),
                         "occurred_at": str(r["occurred_at"]),
+                        "starts_at": r["starts_at"],
+                        "ends_at": r["ends_at"],
                         "service": str(r["service"]),
                         "metric_name": str(r["metric_name"]),
+                        "title": r["title"],
+                        "instance": r["instance"],
                         "severity": str(r["severity"]),
                         "status": str(r["status"]),
                         "fingerprint": r["fingerprint"],
@@ -555,7 +683,7 @@ class Storage:
             if row and row["ticket_id"]:
                 return str(row["ticket_id"]), False
  
-            ticket_id = f"TKT-{int(datetime.now(timezone.utc).timestamp())}"
+            ticket_id = f"TKT-{int(datetime.now(timezone.utc).timestamp())}-{uuid.uuid4().hex[:8]}"
             now = _utc_now()
             conn.execute(
                 """
@@ -1102,7 +1230,8 @@ class Storage:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT event_id, occurred_at, service, metric_name, severity, status, fingerprint, dropped, drop_reason, silenced, silence_rule_id, created_at
+                SELECT event_id, occurred_at, starts_at, ends_at, service, metric_name, title, instance, severity, status, fingerprint,
+                       dropped, drop_reason, silenced, silence_rule_id, created_at
                 FROM normalized_event
                 WHERE fingerprint = ? AND created_at >= ? AND created_at <= ?
                 ORDER BY created_at DESC
@@ -1116,8 +1245,12 @@ class Storage:
                     {
                         "event_id": str(r["event_id"]),
                         "occurred_at": str(r["occurred_at"]),
+                        "starts_at": r["starts_at"],
+                        "ends_at": r["ends_at"],
                         "service": str(r["service"]),
                         "metric_name": str(r["metric_name"]),
+                        "title": r["title"],
+                        "instance": r["instance"],
                         "severity": str(r["severity"]),
                         "status": str(r["status"]),
                         "fingerprint": r["fingerprint"],
